@@ -22,6 +22,10 @@ let package = Package(
             ],
             cSettings: [
                 .headerSearchPath("include/alarmplayer")
+            ],
+            linkerSettings: [
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("AVFAudio")
             ]
         )
     ]

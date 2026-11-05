@@ -15,6 +15,7 @@ import android.app.AlarmManager;
 import android.app.PendingIntent;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.media.*;
 import android.os.Build;
 import android.util.Log;
@@ -25,13 +26,24 @@ import java.util.Objects;
 /** AlarmplayerPlugin */
 public class AlarmplayerPlugin implements FlutterPlugin, MethodCallHandler {
   private static final String TAG = "AlarmplayerPlugin";
-  
+  private static final String PREFS_FILE = "alarmplayer_volume_guard";
+  private static final String PREF_KEY_ORIGINAL_VOLUME = "original_volume";
+  private static final String PREF_KEY_RAISED = "volume_raised";
+  private static final int NO_SAVED_VOLUME = Integer.MIN_VALUE;
+
   public Context context;
   private MediaPlayer mediaPlayer;  // Not static - prevents memory leaks
   private boolean isAlarmPlaying;
   private int originalVolume;       // Not static - prevents memory leaks
+  private boolean volumeWasRaised;  // True between raising STREAM_ALARM and restoring it
   private MethodChannel channel;
   private final Object lock = new Object();  // For thread safety
+
+  // Process-wide flag: true while any plugin instance in this process has a
+  // raised alarm volume in flight. Guards the persisted-state recovery so a
+  // second engine attaching mid-playback does not restore the volume under
+  // the active alarm.
+  private static volatile boolean sRaiseInFlightInProcess = false;
 
 
 
@@ -40,6 +52,7 @@ public class AlarmplayerPlugin implements FlutterPlugin, MethodCallHandler {
     channel = new MethodChannel(flutterPluginBinding.getBinaryMessenger(), "alarmplayer");
     channel.setMethodCallHandler(this);
     context = flutterPluginBinding.getApplicationContext();
+    recoverPersistedVolumeState();
   }
 
 
@@ -96,9 +109,19 @@ public class AlarmplayerPlugin implements FlutterPlugin, MethodCallHandler {
           throw new RuntimeException("AudioManager not available");
         }
 
-        // Save original volume for restoration later
-        originalVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
-        Log.d(TAG, "Original volume: " + originalVolume);
+        // Save original volume for restoration later. Only capture it when no
+        // raise is in flight, so a re-play during playback keeps the first
+        // original instead of saving the raised volume as "original".
+        if (!volumeWasRaised) {
+          originalVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
+          // Persist before raising so a process death between the two writes
+          // is recoverable (a stale entry pointing at the still-current value
+          // is a no-op on recovery).
+          persistVolumeState(originalVolume);
+          Log.d(TAG, "Original volume: " + originalVolume);
+        }
+        volumeWasRaised = true;
+        sRaiseInFlightInProcess = true;
 
         // Calculate and set target volume
         int maxVolume = audioManager.getStreamMaxVolume(AudioManager.STREAM_ALARM);
@@ -159,10 +182,10 @@ public class AlarmplayerPlugin implements FlutterPlugin, MethodCallHandler {
             // Ignore cleanup errors
           }
         }
-        
+
         // Restore volume on error
         restoreVolume();
-        
+
         Log.e(TAG, "Failed to play alarm", e);
         throw new RuntimeException("Failed to play alarm: " + e.getMessage(), e);
       }
@@ -197,17 +220,108 @@ public class AlarmplayerPlugin implements FlutterPlugin, MethodCallHandler {
   }
 
   /**
-   * Restore the original alarm volume
+   * Restore the original alarm volume.
+   *
+   * Writes only when this player actually raised the stream (guarded by
+   * {@code volumeWasRaised}), so a stop() without a prior play() never mutes
+   * the stream, and only when the current stream volume differs from the
+   * saved original, so a manual volume change made during playback is never
+   * clobbered.
    */
   private void restoreVolume() {
+    if (!volumeWasRaised) {
+      Log.d(TAG, "No alarm volume raise in flight, nothing to restore");
+      return;
+    }
     try {
       final AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
       if (audioManager != null) {
-        audioManager.setStreamVolume(AudioManager.STREAM_ALARM, originalVolume, 0);
-        Log.d(TAG, "Volume restored to: " + originalVolume);
+        final int currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
+        if (currentVolume != originalVolume) {
+          audioManager.setStreamVolume(AudioManager.STREAM_ALARM, originalVolume, 0);
+          Log.d(TAG, "Volume restored to: " + originalVolume);
+        } else {
+          Log.d(TAG, "Volume already at original: " + originalVolume);
+        }
+      }
+      volumeWasRaised = false;
+      sRaiseInFlightInProcess = false;
+      clearPersistedVolumeState();
+    } catch (Exception e) {
+      // Keep the raised state so a later stop() or the persisted-state
+      // recovery on the next engine start can still restore the volume.
+      Log.e(TAG, "Error restoring volume", e);
+    }
+  }
+
+
+  /**
+   * Recover the alarm volume if a previous process died while it was raised.
+   *
+   * The in-RAM original dies with the process, so the persisted copy (written
+   * on every raise, cleared on every restore) is the only witness of a leak:
+   * a stale raised entry means the previous process never restored. Restore
+   * the saved original once, then clear the entry. Skipped while another
+   * engine in this process still has a raise in flight; that instance restores
+   * and clears on its own teardown, and the entry survives a second process
+   * death.
+   */
+  private void recoverPersistedVolumeState() {
+    if (sRaiseInFlightInProcess) {
+      Log.d(TAG, "Alarm volume raise in flight in this process, skipping persisted-state recovery");
+      return;
+    }
+    try {
+      final SharedPreferences prefs = volumePrefs();
+      if (!prefs.getBoolean(PREF_KEY_RAISED, false)) {
+        return;
+      }
+      final int savedOriginal = prefs.getInt(PREF_KEY_ORIGINAL_VOLUME, NO_SAVED_VOLUME);
+      // Restore once, then clear regardless of the outcome so the stale state
+      // is never replayed on every subsequent engine start.
+      prefs.edit().clear().apply();
+      if (savedOriginal == NO_SAVED_VOLUME) {
+        return;
+      }
+      final AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+      if (audioManager == null) {
+        return;
+      }
+      final int currentVolume = audioManager.getStreamVolume(AudioManager.STREAM_ALARM);
+      if (currentVolume != savedOriginal) {
+        audioManager.setStreamVolume(AudioManager.STREAM_ALARM, savedOriginal, 0);
+        Log.i(TAG, "Recovered alarm volume from a previous process: " + currentVolume + " -> " + savedOriginal);
       }
     } catch (Exception e) {
-      Log.e(TAG, "Error restoring volume", e);
+      Log.e(TAG, "Error recovering persisted alarm volume", e);
+    }
+  }
+
+
+  private SharedPreferences volumePrefs() {
+    return context.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE);
+  }
+
+  /**
+   * Persist the original volume before raising it, so a killed process can be
+   * recovered on the next engine attach.
+   */
+  private void persistVolumeState(int savedOriginal) {
+    try {
+      volumePrefs().edit()
+          .putInt(PREF_KEY_ORIGINAL_VOLUME, savedOriginal)
+          .putBoolean(PREF_KEY_RAISED, true)
+          .apply();
+    } catch (Exception e) {
+      Log.e(TAG, "Error persisting alarm volume state", e);
+    }
+  }
+
+  private void clearPersistedVolumeState() {
+    try {
+      volumePrefs().edit().clear().apply();
+    } catch (Exception e) {
+      Log.e(TAG, "Error clearing persisted alarm volume state", e);
     }
   }
 
@@ -216,7 +330,7 @@ public class AlarmplayerPlugin implements FlutterPlugin, MethodCallHandler {
   public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
     // Cleanup resources when plugin is detached
     stop();
-    
+
     if (channel != null) {
       channel.setMethodCallHandler(null);
       channel = null;

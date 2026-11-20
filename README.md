@@ -1,6 +1,12 @@
 # alarmplayer
 
-[![pub package](https://img.shields.io/pub/v/alarmplayer.svg)](https://pub.dev/packages/alarmplayer)
+> **CloudAlert fork** of
+> [Mrbluesky-ai/flutter-alarmplayer](https://github.com/Mrbluesky-ai/flutter-alarmplayer)
+> (base: commit `886e962`, v3.0.0). Carries the alarm-volume guard fixes from
+> BHV-2334/BHV-2336: guarded + persisted `STREAM_ALARM` restore on Android and
+> a real iOS implementation. Consumed by bhv-pieper-app and cabp_core as a git
+> dependency — do not publish to pub.dev from this fork.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A Flutter plugin to play alarm sounds at custom volume levels, overriding silent mode and system volume settings. Perfect for critical notifications and alarm applications.

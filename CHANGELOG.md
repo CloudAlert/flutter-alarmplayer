@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-11-05
+
+CloudAlert fork release (base: upstream `Mrbluesky-ai/flutter-alarmplayer`
+commit `886e962`, v3.0.0). Fixes the alarm-volume leak reported in
+BHV-2334 / BHV-2336.
+
+### Fixed
+- **Android: `stop()` no longer mutes the alarm volume.** `restoreVolume()` was
+  called unconditionally and wrote the default `originalVolume` (0) to
+  `STREAM_ALARM` even when nothing had ever been played; it is now guarded by a
+  `volumeWasRaised` flag so only a real raise is ever restored.
+- **Android: raised volume is restored after process death.** The original
+  volume and a raised flag are persisted to SharedPreferences when raising and
+  cleared on restore; on `onAttachedToEngine`, a stale raised entry is restored
+  once and cleared, so a killed process can no longer leave the alarm volume
+  stuck.
+- **Android: manual volume changes during playback are preserved.** Restore
+  writes only when the current stream volume differs from the saved original.
+- **Android: re-play during playback keeps the first saved original** instead
+  of saving the already-raised volume as "original".
+
+### Added
+- **iOS: real `play`/`stop`/`playing` implementation** (`AVAudioPlayer` +
+  `.playback` audio session). Previously only `getPlatformVersion` was answered
+  and `play`/`stop`/`playing` never called their result callbacks, so every
+  Dart `Future` hung forever. Failures now surface as `PlatformException`s
+  (`invalid_arguments`, `asset_not_found`, `audio_session_failed`,
+  `audio_load_failed`, `audio_start_failed`) instead of hangs. iOS does not
+  modify any system volume (iOS exposes no writable alarm stream).
+
 ## [3.0.0] - 2026-08-19
 
 ### Breaking Changes
